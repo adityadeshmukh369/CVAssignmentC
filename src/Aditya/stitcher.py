@@ -35,43 +35,44 @@ class PanaromaStitcher():
                 
         return keypoints1, keypoints2, good_matches
 
-    def homography(self, points):
-        A = []
-        for pt in points:
-            x, y = pt[0], pt[1]
-            X, Y = pt[2], pt[3]
-            A.append([x, y, 1, 0, 0, 0, -1 * X * x, -1 * X * y, -1 * X])
-            A.append([0, 0, 0, x, y, 1, -1 * Y * x, -1 * Y * y, -1 * Y])
-
-        A = np.array(A)
-        u, s, vh = np.linalg.svd(A)
-        H = (vh[-1, :].reshape(3, 3))
-        H = H / H[2, 2]
-        return H
+    def homography(self, data_points):
+        matrix_A = []
+        for point in data_points:
+            src_x, src_y = point[0], point[1]
+            dst_X, dst_Y = point[2], point[3]
+            matrix_A.append([src_x, src_y, 1, 0, 0, 0, -dst_X * src_x, -dst_X * src_y, -dst_X])
+            matrix_A.append([0, 0, 0, src_x, src_y, 1, -dst_Y * src_x, -dst_Y * src_y, -dst_Y])
     
-    def ransac(self, good_pts, iterations=1000):
-        best_inliers = []
-        final_H = None
-        t = 5
-        for i in range(iterations):
-            random_pts = random.choices(good_pts, k=4)
-            H = self.homography(random_pts)
-            inliers = []
-            for pt in good_pts:
-                p = np.array([pt[0], pt[1], 1]).reshape(3, 1)
-                p_1 = np.array([pt[2], pt[3], 1]).reshape(3, 1)
-                Hp = np.dot(H, p)
-                Hp = Hp / Hp[2]
-                dist = np.linalg.norm(p_1 - Hp)
+        matrix_A = np.array(matrix_A)
+        u_matrix, s_values, vh_matrix = np.linalg.svd(matrix_A)
+        homography_matrix = (vh_matrix[-1, :].reshape(3, 3))
+        homography_matrix /= homography_matrix[2, 2]
+        return homography_matrix
+    
+    def ransac(self, valid_points, num_iterations=1000):
+        optimal_inliers = []
+        resulting_H = None
+        threshold = 5
+        for _ in range(num_iterations):
+            selected_points = random.sample(valid_points, k=4)
+            H_matrix = self.compute_homography(selected_points)
+            inlier_points = []
+            for point in valid_points:
+                homogeneous_point = np.array([point[0], point[1], 1]).reshape(3, 1)
+                corresponding_point = np.array([point[2], point[3], 1]).reshape(3, 1)
+                transformed_point = np.dot(H_matrix, homogeneous_point)
+                transformed_point /= transformed_point[2]
+                distance = np.linalg.norm(corresponding_point - transformed_point)
+    
+                if distance < threshold:
+                    inlier_points.append(point)
+    
+            if len(inlier_points) > len(optimal_inliers):
+                optimal_inliers = inlier_points
+                resulting_H = H_matrix
+    
+        return resulting_H
 
-                if dist < t:
-                    inliers.append(pt)
-
-            if len(inliers) > len(best_inliers):
-                best_inliers = inliers
-                final_H = H
-        
-        return final_H
 
     def find_homography(self, keypoints1, keypoints2, good_matches):
         if len(good_matches) < 4:
