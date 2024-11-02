@@ -2,159 +2,166 @@ import pdb
 import glob
 import cv2
 import os
-from typing import List, Tuple, Optional
 import numpy as np
 import random
 
-random.seed(1000)
-
 class PanaromaStitcher():
     def __init__(self):
-        pass
+        # SIFT for feature detection and matching
+        self.sift = cv2.SIFT_create()
+        # FLANN parameters for fast feature matching
+        FLANN_INDEX_KDTREE = 1
+        index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
+        search_params = dict(checks=50)
+        self.flann = cv2.FlannBasedMatcher(index_params, search_params)
 
-    def make_panaroma_for_images_in(self, directory_path):
-        image_folder = directory_path
-        images_for_stitching = sorted(glob.glob(image_folder + os.sep + '*'))
-        print('Found {} Images for stitching'.format(len(images_for_stitching)))
+    def detect_and_match_features(self, img1, img2):
+        # Convert images to grayscale
+        gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+        gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+        
+        # Detect keypoints and compute descriptors
+        keypoints1, descriptors1 = self.sift.detectAndCompute(gray1, None)
+        keypoints2, descriptors2 = self.sift.detectAndCompute(gray2, None)
+        
+        # Match features using FLANN
+        matches = self.flann.knnMatch(descriptors1, descriptors2, k=2)
+        
+        # Apply Lowe's ratio test to filter good matches
+        good_matches = []
+        for m, n in matches:
+            if m.distance < 0.7 * n.distance:
+                good_matches.append(m)
+                
+        return keypoints1, keypoints2, good_matches
 
-        transformations = []
+    def homography(self, points):
+        A = []
+        for pt in points:
+            x, y = pt[0], pt[1]
+            X, Y = pt[2], pt[3]
+            A.append([x, y, 1, 0, 0, 0, -1 * X * x, -1 * X * y, -1 * X])
+            A.append([0, 0, 0, x, y, 1, -1 * Y * x, -1 * Y * y, -1 * Y])
 
-        if len(images_for_stitching) < 2:
-            print('Need at least 2 images to stitch')
-            return None
-        else:
-            scale_factor = 0.25 if len(images_for_stitching) >= 6 else 0.6
-            print('Image size is reduced to:', scale_factor, "times the original size")
-            final_image = cv2.resize(cv2.imread(images_for_stitching[0]), (0, 0), fx=scale_factor, fy=scale_factor)
-            for index in range(1, 5):
-                img_left = final_image
-                img_right = cv2.resize(cv2.imread(images_for_stitching[index]), (0, 0), fx=scale_factor, fy=scale_factor)
-                final_image, transformation_matrix = self.stitch_images(img_left, img_right)
-                transformations.append(transformation_matrix)
-                print('Stitching Done for Image {} with panorama'.format(index))
-        stitched_output = final_image
-
-        return stitched_output, transformations
-
-
-    def apply_warp(self, img, transform, output_dimensions):
-        img_width, img_height = output_dimensions
-        output_image = np.zeros((img_height, img_width, 3) if len(img.shape) == 3 else (img_height, img_width), dtype=img.dtype)
-        img_input_height, img_input_width = img.shape[:2]
-        y_indices, x_indices = np.meshgrid(np.arange(img_height), np.arange(img_width), indexing='ij')
-        homogenous_points = np.stack([x_indices, y_indices, np.ones_like(x_indices)], axis=-1)
-        points_to_transform = homogenous_points.reshape(-1, 3)
-
-        inverse_transform = np.linalg.inv(transform)
-        transformed_points = points_to_transform @ inverse_transform.T
-        transformed_points = transformed_points[:, :2] / transformed_points[:, 2:]
-        transformed_points = transformed_points.reshape(img_height, img_width, 2)
-
-        transformed_x = transformed_points[:, :, 0]
-        transformed_y = transformed_points[:, :, 1]
-        valid_pixels = (transformed_x >= 0) & (transformed_x < img_input_width - 1) & (transformed_y >= 0) & (transformed_y < img_input_height - 1)
-
-        transformed_x = transformed_x.astype(np.int32)
-        transformed_y = transformed_y.astype(np.int32)
-
-        if len(img.shape) == 3:
-            output_image[valid_pixels] = img[transformed_y[valid_pixels], transformed_x[valid_pixels]]
-        else:
-            output_image[valid_pixels] = img[transformed_y[valid_pixels], transformed_x[valid_pixels]]
-
-        return output_image
-
-    def transform_perspective(self, coordinates, transformation):
-        original_shape = coordinates.shape
-
-        if len(coordinates.shape) == 3:
-            coordinates = coordinates.reshape(-1, 2)
-
-        homogenous_coordinates = np.hstack([coordinates, np.ones((coordinates.shape[0], 1))])
-        transformed_coordinates = homogenous_coordinates @ transformation.T
-        transformed_coordinates = transformed_coordinates[:, :2] / transformed_coordinates[:, 2:]
-
-        large_value_mask = np.abs(transformed_coordinates) > 1e10
-        transformed_coordinates[large_value_mask] = 0
-
-        if len(original_shape) == 3:
-            transformed_coordinates = transformed_coordinates.reshape(original_shape)
-
-        return transformed_coordinates
-
-    def compute_ransac(self, match_points):
+        A = np.array(A)
+        u, s, vh = np.linalg.svd(A)
+        H = (vh[-1, :].reshape(3, 3))
+        H = H / H[2, 2]
+        return H
+    
+    def ransac(self, good_pts, iterations=1000):
         best_inliers = []
-        best_transform = []
-        threshold_distance = 5
-        for _ in range(500):
-            sampled_points = random.choices(match_points, k=4)
-            current_transform = self.compute_homography(sampled_points)
-            current_inliers = []
-            for match in match_points:
-                source_point = np.array([match[0], match[1], 1]).reshape(3, 1)
-                destination_point = np.array([match[2], match[3], 1]).reshape(3, 1)
-                transformed_point = np.dot(current_transform, source_point)
-                transformed_point = transformed_point / transformed_point[2]
-                distance = np.linalg.norm(destination_point - transformed_point)
+        final_H = None
+        t = 5
+        for i in range(iterations):
+            random_pts = random.choices(good_pts, k=4)
+            H = self.homography(random_pts)
+            inliers = []
+            for pt in good_pts:
+                p = np.array([pt[0], pt[1], 1]).reshape(3, 1)
+                p_1 = np.array([pt[2], pt[3], 1]).reshape(3, 1)
+                Hp = np.dot(H, p)
+                Hp = Hp / Hp[2]
+                dist = np.linalg.norm(p_1 - Hp)
 
-                if distance < threshold_distance:
-                    current_inliers.append(match)
+                if dist < t:
+                    inliers.append(pt)
 
-            if len(current_inliers) > len(best_inliers):
-                best_inliers, best_transform = current_inliers, current_transform
-        return best_transform
+            if len(inliers) > len(best_inliers):
+                best_inliers = inliers
+                final_H = H
+        
+        return final_H
 
-    def stitch_images(self, img_left, img_right):
-        kp_left, desc_left, kp_right, desc_right = self.extract_keypoints(img_left, img_right)
-        matched_points = self.find_matches(kp_left, kp_right, desc_left, desc_right)
-        homography_matrix = self.compute_ransac(matched_points)
+    def find_homography(self, keypoints1, keypoints2, good_matches):
+        if len(good_matches) < 4:
+            return None
+            
+        # Extract points from keypoints and matches
+        good_pts = []
+        for match in good_matches:
+            pt1 = keypoints1[match.queryIdx].pt
+            pt2 = keypoints2[match.trainIdx].pt
+            good_pts.append([pt1[0], pt1[1], pt2[0], pt2[1]])
+            
+        # Find homography matrix using custom RANSAC implementation
+        H = self.ransac(good_pts)
+        
+        return H
 
-        img_right_height, img_right_width = img_right.shape[:2]
-        img_left_height, img_left_width = img_left.shape[:2]
+    def warp_images(self, img1, img2, H):
+        # Get dimensions
+        h1, w1 = img1.shape[:2]
+        h2, w2 = img2.shape[:2]
+        
+        # Create points for corners of img1
+        corners1 = np.float32([[0, 0], [0, h1], [w1, h1], [w1, 0]]).reshape(-1, 1, 2)
+        corners2 = np.float32([[0, 0], [0, h2], [w2, h2], [w2, 0]]).reshape(-1, 1, 2)
+        
+        # Transform corners of img1
+        corners1_trans = cv2.perspectiveTransform(corners1, H)
+        corners = np.concatenate((corners2, corners1_trans), axis=0)
+        
+        # Find dimensions of new image
+        [x_min, y_min] = np.int32(corners.min(axis=0).ravel())
+        [x_max, y_max] = np.int32(corners.max(axis=0).ravel())
+        
+        # Translation matrix
+        translation_dist = [-x_min, -y_min]
+        H_translation = np.array([[1, 0, translation_dist[0]], 
+                                [0, 1, translation_dist[1]], 
+                                [0, 0, 1]])
+        
+        # Warp images
+        output_img = cv2.warpPerspective(img1, H_translation.dot(H),
+                                       (x_max-x_min, y_max-y_min))
+        
+        # Place img2 on the panorama
+        output_img[translation_dist[1]:h2+translation_dist[1],
+                  translation_dist[0]:w2+translation_dist[0]] = img2
+                  
+        return output_img
 
-        corner_points_right = np.float32([[0, 0], [0, img_right_height], [img_right_width, img_right_height], [img_right_width, 0]]).reshape(-1, 1, 2)
-        corner_points_left = np.float32([[0, 0], [0, img_left_height], [img_left_width, img_left_height], [img_left_width, 0]]).reshape(-1, 1, 2)
-        transformed_corners = self.transform_perspective(corner_points_left, homography_matrix)
-        all_corners = np.concatenate((corner_points_right, transformed_corners), axis=0)
-
-        [min_x, min_y] = np.int32(all_corners.min(axis=0).ravel() - 0.5)
-        [max_x, max_y] = np.int32(all_corners.max(axis=0).ravel() + 0.5)
-
-        translate_transform = np.array([[1, 0, (-min_x)], [0, 1, (-min_y)], [0, 0, 1]]).dot(homography_matrix)
-
-        final_output = self.apply_warp(img_left, translate_transform, (max_x - min_x, max_y - min_y))
-        final_output[(-min_y):img_right_height + (-min_y), (-min_x):img_right_width + (-min_x)] = img_right
-        result = final_output
-        return result, homography_matrix
-
-    def compute_homography(self, coordinate_pairs):
-        matrix_A = []
-        for coordinate_pair in coordinate_pairs:
-            x1, y1 = coordinate_pair[0], coordinate_pair[1]
-            x2, y2 = coordinate_pair[2], coordinate_pair[3]
-            matrix_A.append([x1, y1, 1, 0, 0, 0, -x2 * x1, -x2 * y1, -x2])
-            matrix_A.append([0, 0, 0, x1, y1, 1, -y2 * x1, -y2 * y1, -y2])
-
-        matrix_A = np.array(matrix_A)
-        _, _, vh = np.linalg.svd(matrix_A)
-        transform_matrix = vh[-1, :].reshape(3, 3)
-        transform_matrix = transform_matrix / transform_matrix[2, 2]
-        return transform_matrix
-
-    def extract_keypoints(self, img_left, img_right):
-        keypoints_left, descriptors_left = cv2.SIFT_create().detectAndCompute(img_left, None)
-        keypoints_right, descriptors_right = cv2.SIFT_create().detectAndCompute(img_right, None)
-        return keypoints_left, descriptors_left, keypoints_right, descriptors_right
-
-    def find_matches(self, kp_left, kp_right, desc_left, desc_right):
-        matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
-        matches = matcher.knnMatch(desc_left, desc_right, k=2)
-
-        filtered_matches = []
-        for match1, match2 in matches:
-            if match1.distance < 0.75 * match2.distance:
-                left_coordinates = kp_left[match1.queryIdx].pt
-                right_coordinates = kp_right[match1.trainIdx].pt
-                filtered_matches.append([left_coordinates[0], left_coordinates[1], right_coordinates[0], right_coordinates[1]])
-
-        return filtered_matches
+    def make_panaroma_for_images_in(self, path):
+        imf = path
+        all_images = sorted(glob.glob(imf+os.sep+'*'))
+        print('Found {} Images for stitching'.format(len(all_images)))
+        
+        if len(all_images) < 2:
+            raise ValueError("Need at least 2 images to create a panorama")
+            
+        # Read the first image
+        base_image = cv2.imread(all_images[0])
+        homography_matrix_list = []
+        
+        # Process all images in sequence
+        for i in range(1, len(all_images)):
+            # Read next image
+            next_image = cv2.imread(all_images[i])
+            
+            # Detect and match features
+            keypoints1, keypoints2, good_matches = self.detect_and_match_features(base_image, next_image)
+            
+            # Find homography
+            H = self.find_homography(keypoints1, keypoints2, good_matches)
+            if H is None:
+                print(f"Warning: Could not find good homography for image {i}")
+                continue
+                
+            homography_matrix_list.append(H)
+            
+            # Warp and combine images
+            try:
+                base_image = self.warp_images(base_image, next_image, H)
+            except cv2.error as e:
+                print(f"Error warping image {i}: {e}")
+                continue
+        
+        # Crop the final panorama to remove black borders
+        gray = cv2.cvtColor(base_image, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        x, y, w, h = cv2.boundingRect(contours[0])
+        base_image = base_image[y:y+h, x:x+w]
+        
+        return base_image, homography_matrix_list
