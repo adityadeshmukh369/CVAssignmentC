@@ -2,8 +2,6 @@ import pdb
 import glob
 import cv2
 import os
-from src.JohnDoe import some_function
-from src.JohnDoe.some_folder import folder_func
 from typing import List, Tuple, Optional
 import numpy as np
 import random
